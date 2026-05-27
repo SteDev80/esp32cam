@@ -5,10 +5,19 @@
 #include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
 
 // ====== Configura qui la tua rete Wi-Fi ======
+#ifndef WIFI_SSID
 const char *WIFI_SSID = "NOME_WIFI";
+#endif
+#ifndef WIFI_PASSWORD
 const char *WIFI_PASSWORD = "PASSWORD_WIFI";
+#endif
 
 // Nome visibile in rete: http://esp32cam.local/ se il router supporta mDNS.
 const char *HOSTNAME = "esp32cam";
@@ -16,6 +25,20 @@ const char *HOSTNAME = "esp32cam";
 // Credenziali per la pagina di aggiornamento firmware.
 const char *UPDATE_USER = "admin";
 const char *UPDATE_PASSWORD = "admin";
+
+// ====== Telegram ======
+// Crea un bot con @BotFather e inserisci token/chat id qui o in secrets.h.
+#ifndef TELEGRAM_BOT_TOKEN
+const char *TELEGRAM_BOT_TOKEN = "INSERISCI_TOKEN_BOT";
+#endif
+#ifndef TELEGRAM_CHAT_ID
+const char *TELEGRAM_CHAT_ID = "INSERISCI_CHAT_ID";
+#endif
+
+const uint32_t DETECTION_INTERVAL_MS = 2500;
+const uint32_t TELEGRAM_COOLDOWN_MS = 60000;
+const uint16_t FRAME_DIFF_THRESHOLD = 22;
+const char *DETECTION_MODE = "movimento";
 
 // ====== Pin ESP32-CAM AI Thinker ======
 #define PWDN_GPIO_NUM 32
@@ -58,6 +81,15 @@ uint32_t snapshotIntervalMs = 5000;
 bool flashEnabled = false;
 bool relay1Enabled = false;
 bool relay2Enabled = false;
+bool alertEnabled = false;
+uint32_t lastDetectionMs = 0;
+uint32_t lastTelegramMs = 0;
+uint32_t lastAlertMs = 0;
+uint32_t previousFrameSignature = 0;
+uint8_t *lastAlertJpg = NULL;
+size_t lastAlertJpgLen = 0;
+uint8_t previousFrameSamples[64];
+bool hasPreviousFrameSamples = false;
 
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!doctype html>
@@ -86,6 +118,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     .meter { margin-top: 14px; height: 16px; border-radius: 999px; overflow: hidden; background: #0b1117; border: 1px solid #304252; }
     .meter span { display: block; height: 100%; width: 0%; background: #2f9e44; transition: width .2s ease; }
     .readout { display: grid; gap: 4px; margin-top: 10px; color: #c9d6e2; }
+    .notice { color: #c9d6e2; font-size: .9rem; line-height: 1.5; margin: 10px 0 0; }
     .status { color: #b6c4d2; font-size: .92rem; margin-top: 10px; min-height: 1.2em; }
     @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
   </style>
@@ -149,6 +182,21 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <button class="secondary" onclick="refreshStatus()">Aggiorna</button>
       </div>
     </section>
+
+    <section>
+      <h2>Allarme Telegram</h2>
+      <div class="controls">
+        <label class="toggle">Rilevamento presenza
+          <input id="alert" type="checkbox" onchange="setAlert(this.checked)">
+        </label>
+        <button class="secondary" onclick="testTelegram()">Test Telegram</button>
+      </div>
+      <p class="notice">Su ESP32-CAM classica il riconoscimento volto completo non e disponibile con il core ESP32 attuale. Questo allarme usa rilevamento variazione immagine e invia la foto quando la scena cambia.</p>
+      <div class="controls">
+        <a href="/last_alert.jpg" target="_blank">Ultimo fotogramma salvato</a>
+      </div>
+      <p class="status" id="alertStatus"></p>
+    </section>
   </div>
 </main>
 <script>
@@ -168,9 +216,12 @@ function updateUi(data) {
   document.getElementById('flash').checked = data.flash;
   document.getElementById('relay1').checked = data.relay1;
   document.getElementById('relay2').checked = data.relay2;
+  document.getElementById('alert').checked = data.alert;
   document.getElementById('batteryBar').style.width = data.batteryPercent + '%';
   document.getElementById('batteryVoltage').textContent = data.batteryVoltage.toFixed(2) + ' V';
   document.getElementById('batteryPercent').textContent = data.batteryPercent + ' % stimato';
+  document.getElementById('alertStatus').textContent =
+    'Modo: ' + data.detectionMode + ' | ultimo allarme: ' + (data.lastAlertSecondsAgo < 0 ? 'mai' : data.lastAlertSecondsAgo + ' s fa');
 }
 
 async function refreshStatus() {
@@ -218,6 +269,18 @@ async function setRelay(index, enabled) {
   const data = await res.json();
   updateUi(data);
   document.getElementById('ioStatus').textContent = 'Relay ' + index + ' ' + (enabled ? 'attivo' : 'spento');
+}
+
+async function setAlert(enabled) {
+  const res = await fetch('/set?alert=' + (enabled ? '1' : '0'));
+  const data = await res.json();
+  updateUi(data);
+}
+
+async function testTelegram() {
+  const res = await fetch('/telegram_test');
+  const text = await res.text();
+  document.getElementById('alertStatus').textContent = text;
 }
 
 loadStatus().catch(() => setStatus('Errore nel caricamento stato'));
@@ -377,14 +440,173 @@ uint8_t batteryPercent(float voltage) {
   return constrain((int)round(percent), 0, 100);
 }
 
+bool isTelegramConfigured() {
+  return strcmp(TELEGRAM_BOT_TOKEN, "INSERISCI_TOKEN_BOT") != 0 &&
+         strcmp(TELEGRAM_CHAT_ID, "INSERISCI_CHAT_ID") != 0 &&
+         strlen(TELEGRAM_BOT_TOKEN) > 10 &&
+         strlen(TELEGRAM_CHAT_ID) > 0;
+}
+
+void saveLastAlertFrame(camera_fb_t *fb) {
+  if (!fb || fb->len == 0) {
+    return;
+  }
+
+  if (lastAlertJpg) {
+    free(lastAlertJpg);
+    lastAlertJpg = NULL;
+    lastAlertJpgLen = 0;
+  }
+
+  lastAlertJpg = psramFound() ? (uint8_t *)ps_malloc(fb->len) : (uint8_t *)malloc(fb->len);
+  if (!lastAlertJpg) {
+    Serial.println("Memoria insufficiente per salvare alert");
+    return;
+  }
+
+  memcpy(lastAlertJpg, fb->buf, fb->len);
+  lastAlertJpgLen = fb->len;
+  lastAlertMs = millis();
+}
+
+bool sceneChanged(camera_fb_t *fb) {
+  if (!fb || fb->len < sizeof(previousFrameSamples) * 2) {
+    return false;
+  }
+
+  uint32_t totalDiff = 0;
+  uint32_t step = fb->len / sizeof(previousFrameSamples);
+
+  for (size_t i = 0; i < sizeof(previousFrameSamples); i++) {
+    uint8_t current = fb->buf[i * step];
+    if (hasPreviousFrameSamples) {
+      totalDiff += abs((int)current - (int)previousFrameSamples[i]);
+    }
+    previousFrameSamples[i] = current;
+  }
+
+  if (!hasPreviousFrameSamples) {
+    hasPreviousFrameSamples = true;
+    return false;
+  }
+
+  uint16_t averageDiff = totalDiff / sizeof(previousFrameSamples);
+  return averageDiff >= FRAME_DIFF_THRESHOLD;
+}
+
+bool sendTelegramPhoto(const uint8_t *jpg, size_t jpgLen, const String &caption) {
+  if (!isTelegramConfigured()) {
+    Serial.println("Telegram non configurato");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15000);
+
+  if (!client.connect("api.telegram.org", 443)) {
+    Serial.println("Connessione Telegram fallita");
+    return false;
+  }
+
+  String boundary = "----ESP32CamBoundary";
+  String head = "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n";
+  head += String(TELEGRAM_CHAT_ID) + "\r\n";
+  head += "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"caption\"\r\n\r\n";
+  head += caption + "\r\n";
+  head += "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"photo\"; filename=\"esp32cam.jpg\"\r\n";
+  head += "Content-Type: image/jpeg\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+  size_t contentLength = head.length() + jpgLen + tail.length();
+
+  client.print("POST /bot");
+  client.print(TELEGRAM_BOT_TOKEN);
+  client.println("/sendPhoto HTTP/1.1");
+  client.println("Host: api.telegram.org");
+  client.println("Connection: close");
+  client.print("Content-Type: multipart/form-data; boundary=");
+  client.println(boundary);
+  client.print("Content-Length: ");
+  client.println(contentLength);
+  client.println();
+  client.print(head);
+  client.write(jpg, jpgLen);
+  client.print(tail);
+
+  String statusLine = client.readStringUntil('\n');
+  bool ok = statusLine.indexOf("200") > 0;
+  Serial.println(statusLine);
+  client.stop();
+  return ok;
+}
+
+String urlEncode(const String &value) {
+  String encoded;
+  const char *hex = "0123456789ABCDEF";
+
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += c;
+    } else if (c == ' ') {
+      encoded += '+';
+    } else {
+      encoded += '%';
+      encoded += hex[(c >> 4) & 0x0F];
+      encoded += hex[c & 0x0F];
+    }
+  }
+
+  return encoded;
+}
+
+bool sendTelegramText(const String &message) {
+  if (!isTelegramConfigured()) {
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15000);
+
+  if (!client.connect("api.telegram.org", 443)) {
+    return false;
+  }
+
+  String body = "chat_id=" + urlEncode(String(TELEGRAM_CHAT_ID)) + "&text=" + urlEncode(message);
+  client.print("POST /bot");
+  client.print(TELEGRAM_BOT_TOKEN);
+  client.println("/sendMessage HTTP/1.1");
+  client.println("Host: api.telegram.org");
+  client.println("Connection: close");
+  client.println("Content-Type: application/x-www-form-urlencoded");
+  client.print("Content-Length: ");
+  client.println(body.length());
+  client.println();
+  client.print(body);
+
+  String statusLine = client.readStringUntil('\n');
+  bool ok = statusLine.indexOf("200") > 0;
+  client.stop();
+  return ok;
+}
+
 void handleStatus() {
   float batteryVoltage = readBatteryVoltage();
+  int32_t lastAlertSecondsAgo = lastAlertMs == 0 ? -1 : (int32_t)((millis() - lastAlertMs) / 1000);
   String json = "{";
   json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"intervalSeconds\":" + String(snapshotIntervalMs / 1000) + ",";
   json += "\"flash\":" + String(flashEnabled ? "true" : "false") + ",";
   json += "\"relay1\":" + String(relay1Enabled ? "true" : "false") + ",";
   json += "\"relay2\":" + String(relay2Enabled ? "true" : "false") + ",";
+  json += "\"alert\":" + String(alertEnabled ? "true" : "false") + ",";
+  json += "\"telegramConfigured\":" + String(isTelegramConfigured() ? "true" : "false") + ",";
+  json += "\"detectionMode\":\"" + String(DETECTION_MODE) + "\",";
+  json += "\"lastAlertSecondsAgo\":" + String(lastAlertSecondsAgo) + ",";
   json += "\"batteryVoltage\":" + String(batteryVoltage, 2) + ",";
   json += "\"batteryPercent\":" + String(batteryPercent(batteryVoltage));
   json += "}";
@@ -416,6 +638,12 @@ void handleSet() {
     writeRelay(RELAY2_PIN, relay2Enabled);
   }
 
+  if (server.hasArg("alert")) {
+    alertEnabled = server.arg("alert") == "1";
+    prefs.putBool("alert", alertEnabled);
+    hasPreviousFrameSamples = false;
+  }
+
   handleStatus();
 }
 
@@ -428,6 +656,48 @@ void handleCapture() {
 
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   server.send_P(200, "image/jpeg", (const char *)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+void handleLastAlert() {
+  if (!lastAlertJpg || lastAlertJpgLen == 0) {
+    server.send(404, "text/plain", "Nessun fotogramma salvato");
+    return;
+  }
+
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.send_P(200, "image/jpeg", (const char *)lastAlertJpg, lastAlertJpgLen);
+}
+
+void handleTelegramTest() {
+  bool ok = sendTelegramText("Test ESP32-CAM: Telegram configurato correttamente.");
+  server.send(ok ? 200 : 500, "text/plain", ok ? "Test Telegram inviato" : "Test Telegram fallito o non configurato");
+}
+
+void monitorAlerts() {
+  if (!alertEnabled || millis() - lastDetectionMs < DETECTION_INTERVAL_MS) {
+    return;
+  }
+
+  lastDetectionMs = millis();
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Alert: frame non disponibile");
+    return;
+  }
+
+  if (sceneChanged(fb)) {
+    saveLastAlertFrame(fb);
+
+    if (millis() - lastTelegramMs >= TELEGRAM_COOLDOWN_MS) {
+      String caption = "ESP32-CAM: presenza rilevata";
+      bool ok = sendTelegramPhoto(fb->buf, fb->len, caption);
+      if (ok) {
+        lastTelegramMs = millis();
+      }
+    }
+  }
+
   esp_camera_fb_return(fb);
 }
 
@@ -517,6 +787,8 @@ void setupServer() {
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/set", HTTP_GET, handleSet);
   server.on("/capture.jpg", HTTP_GET, handleCapture);
+  server.on("/last_alert.jpg", HTTP_GET, handleLastAlert);
+  server.on("/telegram_test", HTTP_GET, handleTelegramTest);
   server.on("/update", HTTP_GET, handleUpdatePage);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.onNotFound([]() {
@@ -565,6 +837,7 @@ void setup() {
   flashEnabled = prefs.getBool("flash", false);
   relay1Enabled = prefs.getBool("relay1", false);
   relay2Enabled = prefs.getBool("relay2", false);
+  alertEnabled = prefs.getBool("alert", false);
   digitalWrite(FLASH_LED_PIN, flashEnabled ? HIGH : LOW);
   writeRelay(RELAY1_PIN, relay1Enabled);
   writeRelay(RELAY2_PIN, relay2Enabled);
@@ -583,4 +856,5 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
+  monitorAlerts();
 }

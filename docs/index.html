@@ -229,7 +229,7 @@
     <div class="wrap hero">
       <div>
         <h1>ESP32-CAM Web Server</h1>
-        <p class="lead">Firmware Arduino per ESP32-CAM AI Thinker con streaming live, foto periodiche, aggiornamento OTA, due uscite per relay e monitor batteria dalla stessa interfaccia web.</p>
+        <p class="lead">Firmware Arduino per ESP32-CAM AI Thinker con streaming live, foto periodiche, aggiornamento OTA, due uscite per relay, monitor batteria e allarme Telegram dalla stessa interfaccia web.</p>
       </div>
       <div class="preview" aria-label="Anteprima interfaccia web">
         <div class="preview-top">
@@ -266,6 +266,10 @@
         <article class="card">
           <h3>GPIO e batteria</h3>
           <p>Due uscite digitali per relay e lettura della tensione batteria tramite ADC1.</p>
+        </article>
+        <article class="card">
+          <h3>Allarme Telegram</h3>
+          <p>Invio del fotogramma quando viene rilevata una presenza o una variazione importante nella scena.</p>
         </article>
       </div>
     </section>
@@ -326,6 +330,14 @@
       <h2>Aggiornamento via browser</h2>
       <p>Dopo il primo caricamento puoi compilare il firmware, esportare il file <code>.bin</code> e caricarlo da:</p>
       <pre><code>http://IP_DELLA_ESP32CAM/update</code></pre>
+    </section>
+
+    <section>
+      <h2>Telegram</h2>
+      <p>Inserisci token bot e chat id in <code>secrets.h</code>, poi usa il pulsante di test dalla pagina web. L'allarme salva l'ultimo fotogramma su <code>/last_alert.jpg</code> e invia una foto quando rileva una presenza.</p>
+      <pre><code>#define TELEGRAM_BOT_TOKEN "123456789:AA..."
+#define TELEGRAM_CHAT_ID "123456789"</code></pre>
+      <p>La ESP32-CAM AI Thinker con core ESP32 3.x non supporta il riconoscimento volto completo in locale; per identificare persone specifiche serve ESP32-S3 o un servizio esterno.</p>
     </section>
   </main>
 

@@ -11,6 +11,8 @@ Firmware Arduino per ESP32-CAM AI Thinker con camera OV2640. Espone una pagina w
 - Controllo LED flash integrato.
 - Due uscite digitali per relay o altri moduli.
 - Lettura tensione batteria con percentuale stimata.
+- Allarme Telegram con invio foto quando viene rilevata una presenza.
+- Ultimo fotogramma di allarme scaricabile da browser.
 - Salvataggio in memoria di intervallo foto, flash e stato uscite.
 
 ## Hardware
@@ -35,12 +37,14 @@ Firmware Arduino per ESP32-CAM AI Thinker con camera OV2640. Espone una pagina w
 
 ## Configurazione Wi-Fi
 
-Apri [Esp32cam.ino](./Esp32cam.ino) e modifica:
+Copia `secrets.example.h` in `secrets.h` e modifica:
 
-```cpp
-const char *WIFI_SSID = "NOME_WIFI";
-const char *WIFI_PASSWORD = "PASSWORD_WIFI";
+```c
+#define WIFI_SSID "NOME_WIFI"
+#define WIFI_PASSWORD "PASSWORD_WIFI"
 ```
+
+`secrets.h` e ignorato da Git, quindi puoi tenerci dentro password e token senza pubblicarli.
 
 Cambia anche la password OTA, soprattutto su reti non private:
 
@@ -81,6 +85,8 @@ Dalla pagina puoi:
 - accendere o spegnere il flash;
 - pilotare Relay 1 e Relay 2;
 - leggere tensione e percentuale batteria;
+- attivare l'allarme Telegram;
+- scaricare l'ultimo fotogramma salvato da `/last_alert.jpg`;
 - accedere alla pagina di aggiornamento firmware.
 
 ## Relay e uscite digitali
@@ -145,6 +151,26 @@ http://IP_DELLA_ESP32CAM/update
 
 Dopo il primo upload via USB, se PC e scheda sono sulla stessa rete, in `Tools > Port` dovrebbe comparire una porta di rete simile a `esp32cam`. La password richiesta e `UPDATE_PASSWORD`.
 
+## Telegram e rilevamento presenza
+
+Crea un bot con `@BotFather`, recupera il token e il tuo chat id, poi inseriscili in `secrets.h`:
+
+```c
+#define TELEGRAM_BOT_TOKEN "123456789:AA..."
+#define TELEGRAM_CHAT_ID "123456789"
+```
+
+Dalla pagina web puoi attivare `Rilevamento presenza` e usare `Test Telegram` per verificare token e chat id.
+
+Quando la camera rileva una variazione significativa dell'immagine:
+
+- salva il JPEG in RAM;
+- lo rende disponibile su `/last_alert.jpg`;
+- lo invia a Telegram come foto;
+- aspetta `TELEGRAM_COOLDOWN_MS` prima di inviare un altro messaggio.
+
+Il rilevamento attuale e basato su variazione del fotogramma, quindi puo generare falsi positivi con cambi di luce o movimento non umano. Il riconoscimento volto vero non e disponibile sulla ESP32-CAM AI Thinker con il core ESP32 3.x installato; per riconoscere persone specifiche serve ESP32-S3 o un servizio esterno di analisi immagine.
+
 ## GitHub Pages
 
 Questo repository include una pagina statica in [docs/index.html](./docs/index.html). Per pubblicarla:
@@ -161,3 +187,4 @@ Questo repository include una pagina statica in [docs/index.html](./docs/index.h
 - Se l'immagine e capovolta, cambia `sensor->set_vflip(sensor, 1);` mettendo `0`.
 - Se usi la microSD, evita GPIO13 e GPIO14 per i relay.
 - Non pubblicare password Wi-Fi reali nel repository.
+- Se Telegram non invia, controlla token, chat id e che la scheda abbia accesso Internet.
